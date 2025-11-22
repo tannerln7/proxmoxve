@@ -59,6 +59,7 @@ from .const import (
     INTEGRATION_TITLE,
     LOGGER,
     PROXMOX_CLIENT,
+    PROXMOX_CLIENTS,
     VERSION_REMOVE_YAML,
     ProxmoxType,
 )
@@ -375,7 +376,7 @@ async def async_migrate_entry(hass: HomeAssistant, config_entry: ConfigEntry) ->
                         (
                             DOMAIN,
                             (
-                                f"{config_entry.entry_id}_{ProxmoxType.Disk.upper()}_{node}_{disk["wwn"] if "wwn" in disk else disk["by_id_link"] if "by_id_link" in disk else disk["serial"]}"
+                                f"{config_entry.entry_id}_{ProxmoxType.Disk.upper()}_{node}_{disk['wwn'] if 'wwn' in disk else disk['by_id_link'] if 'by_id_link' in disk else disk['serial']}"
                             ),
                         )
                     },
@@ -426,7 +427,7 @@ async def async_migrate_entry(hass: HomeAssistant, config_entry: ConfigEntry) ->
                         (
                             DOMAIN,
                             (
-                                f"{config_entry.entry_id}_{ProxmoxType.Disk.upper()}_{node}_{disk["by_id_link"] if "by_id_link" in disk else disk["serial"]}"
+                                f"{config_entry.entry_id}_{ProxmoxType.Disk.upper()}_{node}_{disk['by_id_link'] if 'by_id_link' in disk else disk['serial']}"
                             ),
                         )
                     },
@@ -437,7 +438,7 @@ async def async_migrate_entry(hass: HomeAssistant, config_entry: ConfigEntry) ->
                         (
                             DOMAIN,
                             (
-                                f"{config_entry.entry_id}_{ProxmoxType.Disk.upper()}_{node}_{disk["wwn"] if "wwn" in disk else disk["by_id_link"] if "by_id_link" in disk else disk["serial"]}"
+                                f"{config_entry.entry_id}_{ProxmoxType.Disk.upper()}_{node}_{disk['wwn'] if 'wwn' in disk else disk['by_id_link'] if 'by_id_link' in disk else disk['serial']}"
                             ),
                         )
                     },
@@ -471,7 +472,8 @@ async def async_migrate_entry(hass: HomeAssistant, config_entry: ConfigEntry) ->
 
 async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> bool:
     """Set up the platform."""
-    hass.data.setdefault(DOMAIN, {})
+    domain_data = hass.data.setdefault(DOMAIN, {})
+    clients = domain_data.setdefault(PROXMOX_CLIENTS, {})
     entry_data = config_entry.data
 
     host = entry_data[CONF_HOST]
@@ -482,16 +484,31 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> b
     password = entry_data[CONF_PASSWORD]
     verify_ssl = entry_data[CONF_VERIFY_SSL]
 
-    # Construct an API client with the given data for the given host
-    proxmox_client = ProxmoxClient(
-        host=host,
-        port=port,
-        user=user,
-        token_name=token_name,
-        realm=realm,
-        password=password,
-        verify_ssl=verify_ssl,
-    )
+    # Reuse one Proxmox client per entry so we keep a single requests session alive
+    # and avoid exhausting urllib3 connection pools with duplicate clients.
+    proxmox_client = clients.get(config_entry.entry_id)
+    if proxmox_client is not None:
+        proxmox_client.reconfigure(
+            host=host,
+            port=port,
+            user=user,
+            token_name=token_name,
+            realm=realm,
+            password=password,
+            verify_ssl=verify_ssl,
+        )
+    else:
+        proxmox_client = ProxmoxClient(
+            host=host,
+            port=port,
+            user=user,
+            token_name=token_name,
+            realm=realm,
+            password=password,
+            verify_ssl=verify_ssl,
+        )
+        clients[config_entry.entry_id] = proxmox_client
+
     try:
         await hass.async_add_executor_job(proxmox_client.build_client)
     except AuthenticationError as error:
@@ -763,7 +780,16 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> b
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
-    return unload_ok  # noqa: RET504
+    if unload_ok:
+        domain_data = hass.data.get(DOMAIN)
+        if domain_data is not None and PROXMOX_CLIENTS in domain_data:
+            proxmox_clients = domain_data[PROXMOX_CLIENTS]
+            proxmox_client = proxmox_clients.pop(entry.entry_id, None)
+            if proxmox_client is not None:
+                await hass.async_add_executor_job(proxmox_client.close)
+            if not proxmox_clients:
+                domain_data.pop(PROXMOX_CLIENTS)
+    return unload_ok
 
 
 async def update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:
